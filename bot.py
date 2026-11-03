@@ -591,7 +591,7 @@ class CryptoPayClient:
 
     async def create_invoice(self, user_id: int) -> dict[str, Any]:
         """
-        Создаёт фиатный счёт на 150 RUB с зачислением USDT.
+        Создаёт фиатный счёт на 99 RUB с зачислением USDT.
 
         payload связывает счёт с Telegram ID; при проверке это значение
         обязательно сверяется повторно, а не доверяется только callback_data.
