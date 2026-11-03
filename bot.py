@@ -1,18 +1,19 @@
 """
 Telegram Business Backup Bot.
 
-Python 3.10+, aiogram 3.x, aiosqlite, aiohttp.
+Python 3.10+, aiogram 3.x, aiosqlite.
 Запуск: python bot.py
 
 Перед запуском задайте переменные окружения:
     BOT_TOKEN — токен основного Telegram-бота;
-    CRYPTO_PAY_TOKEN — токен приложения Crypto Pay;
     ADMIN_ID — числовой Telegram ID администратора.
 
 Необязательные переменные:
-    DB_PATH — путь к SQLite-файлу, по умолчанию bot.db;
-    CRYPTO_PAY_API_URL — по умолчанию https://pay.crypt.bot/api.
-    Для testnet можно указать https://testnet-pay.crypt.bot/api.
+    DB_PATH — путь к SQLite-файлу, по умолчанию bot.db.
+
+Оплата подписки реализована через Telegram Stars. Для приёма Stars в BotFather
+должны быть включены платежи, а товар должен соответствовать правилам Telegram
+для цифровых товаров и услуг.
 """
 
 from __future__ import annotations
@@ -25,11 +26,9 @@ import queue
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -41,7 +40,9 @@ from aiogram.types import (
     BusinessMessagesDeleted,
     CallbackQuery,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
@@ -50,7 +51,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 SUBSCRIPTION_DAYS = 30
-SUBSCRIPTION_AMOUNT_RUB = Decimal("99")
+STARS_PRICE = 150
 MESSAGE_RETENTION_HOURS = 48
 CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 
@@ -65,22 +66,18 @@ class Settings:
     """Настройки приложения, прочитанные из переменных окружения."""
 
     bot_token: str
-    crypto_pay_token: str
     admin_id: int
     db_path: str
-    crypto_pay_api_url: str
 
     @classmethod
     def from_env(cls) -> "Settings":
         bot_token = os.getenv("BOT_TOKEN", "").strip()
-        crypto_pay_token = os.getenv("CRYPTO_PAY_TOKEN", "").strip()
         admin_id_raw = os.getenv("ADMIN_ID", "").strip()
 
         missing = [
             name
             for name, value in (
                 ("BOT_TOKEN", bot_token),
-                ("CRYPTO_PAY_TOKEN", crypto_pay_token),
                 ("ADMIN_ID", admin_id_raw),
             )
             if not value
@@ -97,12 +94,8 @@ class Settings:
 
         return cls(
             bot_token=bot_token,
-            crypto_pay_token=crypto_pay_token,
             admin_id=admin_id,
             db_path=os.getenv("DB_PATH", "bot.db").strip() or "bot.db",
-            crypto_pay_api_url=os.getenv(
-                "CRYPTO_PAY_API_URL", "https://pay.crypt.bot/api"
-            ).rstrip("/"),
         )
 
 
@@ -292,10 +285,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_business_connections_owner
                 ON business_connections(owner_id);
 
-            -- Оплаченный счёт записывается сюда в той же транзакции, что и
-            -- продление. PRIMARY KEY не даёт активировать один счёт дважды.
-            CREATE TABLE IF NOT EXISTS paid_invoices (
-                invoice_id INTEGER PRIMARY KEY,
+            -- Telegram charge_id записывается сюда в той же транзакции, что и
+            -- продление. PRIMARY KEY не даёт активировать один платёж дважды.
+            CREATE TABLE IF NOT EXISTS paid_star_payments (
+                charge_id TEXT PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 paid_at DATETIME NOT NULL
             );
@@ -431,14 +424,14 @@ class Database:
         return premium_until is not None and premium_until > utc_now()
 
     async def activate_premium(
-        self, user_id: int, invoice_id: int
+        self, user_id: int, charge_id: str
     ) -> tuple[bool, datetime]:
         """
-        Атомарно продлевает подписку и помечает счёт обработанным.
+        Атомарно продлевает подписку и помечает платёж обработанным.
 
-        Возвращает (True, новая_дата) только при первой активации счёта.
-        BEGIN IMMEDIATE заранее берёт блокировку записи SQLite, поэтому два
-        одновременных нажатия «Проверить оплату» не продлят срок дважды.
+        Возвращает (True, новая_дата) только при первой обработке charge_id.
+        BEGIN IMMEDIATE заранее берёт блокировку записи SQLite, поэтому
+        повторная доставка successful_payment не продлит срок дважды.
         """
 
         async with self._lock:
@@ -453,8 +446,8 @@ class Database:
                 user_row = await cursor.fetchone()
 
                 cursor = await self.connection.execute(
-                    "SELECT 1 FROM paid_invoices WHERE invoice_id = ?",
-                    (invoice_id,),
+                    "SELECT 1 FROM paid_star_payments WHERE charge_id = ?",
+                    (charge_id,),
                 )
                 already_paid = await cursor.fetchone()
                 current_until = (
@@ -490,10 +483,10 @@ class Database:
                 )
                 await self.connection.execute(
                     """
-                    INSERT INTO paid_invoices(invoice_id, user_id, paid_at)
+                    INSERT INTO paid_star_payments(charge_id, user_id, paid_at)
                     VALUES (?, ?, ?)
                     """,
-                    (invoice_id, user_id, paid_at_db),
+                    (charge_id, user_id, paid_at_db),
                 )
                 await self.connection.commit()
                 return True, new_until
@@ -533,105 +526,6 @@ class Database:
                 row = await cursor.fetchone()
                 result[name] = int(row[0])
         return result
-
-
-# ---------------------------------------------------------------------------
-# Crypto Pay
-# ---------------------------------------------------------------------------
-
-
-class CryptoPayError(Exception):
-    """Понятная ошибка интеграции без раскрытия API-токена."""
-
-
-class CryptoPayClient:
-    def __init__(self, token: str, api_url: str) -> None:
-        self.api_url = api_url
-        self._headers = {"Crypto-Pay-API-Token": token}
-        self._session: aiohttp.ClientSession | None = None
-
-    async def start(self) -> None:
-        timeout = aiohttp.ClientTimeout(total=30)
-        self._session = aiohttp.ClientSession(timeout=timeout)
-
-    async def close(self) -> None:
-        if self._session is not None:
-            await self._session.close()
-            self._session = None
-
-    async def _request(
-        self, method: str, parameters: dict[str, Any]
-    ) -> Any:
-        if self._session is None:
-            raise RuntimeError("Crypto Pay client не запущен")
-
-        try:
-            async with self._session.post(
-                f"{self.api_url}/{method}",
-                json=parameters,
-                headers=self._headers,
-            ) as response:
-                try:
-                    data = await response.json(content_type=None)
-                except (aiohttp.ContentTypeError, ValueError) as exc:
-                    raise CryptoPayError(
-                        f"Crypto Pay вернул не JSON (HTTP {response.status})"
-                    ) from exc
-
-                if response.status != 200 or not data.get("ok"):
-                    error = data.get("error", "неизвестная ошибка")
-                    raise CryptoPayError(
-                        f"Crypto Pay {method}: HTTP {response.status}, {error}"
-                    )
-                return data.get("result")
-        except aiohttp.ClientError as exc:
-            raise CryptoPayError(f"Сетевая ошибка Crypto Pay: {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise CryptoPayError("Crypto Pay не ответил за 30 секунд") from exc
-
-    async def create_invoice(self, user_id: int) -> dict[str, Any]:
-        """
-        Создаёт фиатный счёт на 99 RUB с зачислением USDT.
-
-        payload связывает счёт с Telegram ID; при проверке это значение
-        обязательно сверяется повторно, а не доверяется только callback_data.
-        """
-
-        invoice = await self._request(
-            "createInvoice",
-            {
-                "asset": "USDT",
-                "fiat": "RUB",
-                "currency_type": "fiat",
-                "amount": str(SUBSCRIPTION_AMOUNT_RUB),
-                "description": (
-                    f"Подписка Telegram Business Backup на {SUBSCRIPTION_DAYS} дней"
-                ),
-                "payload": str(user_id),
-                "expires_in": 3600,
-            },
-        )
-        if not isinstance(invoice, dict):
-            raise CryptoPayError("Crypto Pay вернул некорректный объект счёта")
-        if not invoice.get("invoice_id") or not invoice.get("pay_url"):
-            raise CryptoPayError("В ответе Crypto Pay нет invoice_id/pay_url")
-        return invoice
-
-    async def get_invoice(self, invoice_id: int) -> dict[str, Any] | None:
-        result = await self._request(
-            "getInvoices", {"invoice_ids": str(invoice_id)}
-        )
-
-        # По документации result — массив Invoice. Обработка items оставлена
-        # для совместимости с прокси, которые возвращают постраничный объект.
-        items = result.get("items", []) if isinstance(result, dict) else result
-        if not isinstance(items, list):
-            raise CryptoPayError("Crypto Pay вернул некорректный список счетов")
-
-        for invoice in items:
-            if int(invoice.get("invoice_id", 0)) == invoice_id:
-                return invoice
-        return None
 
 
 # ---------------------------------------------------------------------------
@@ -773,15 +667,37 @@ async def get_authorized_owner(
 # ---------------------------------------------------------------------------
 
 
-def payment_keyboard(invoice_id: int, user_id: int, pay_url: str) -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Оплатить 99 ₽", url=pay_url)
-    builder.button(
-        text="🔄 Проверить оплату",
-        callback_data=f"paycheck:{invoice_id}:{user_id}",
+def subscription_payload(user_id: int) -> str:
+    """Формирует подписанный пользователем payload счёта Telegram Stars."""
+
+    return f"subscription:{user_id}"
+
+
+async def send_subscription_invoice(bot: Bot, user_id: int) -> None:
+    """
+    Отправляет пользователю нативный счёт Telegram Stars.
+
+    Для цифровых товаров за Stars provider_token обязан быть пустой строкой,
+    валюта — XTR, а amount указывается в целых Stars.
+    """
+
+    await bot.send_invoice(
+        chat_id=user_id,
+        title=f"Подписка FisherBot на {SUBSCRIPTION_DAYS} дней",
+        description=(
+            "Доступ к архиву изменённых и удалённых сообщений "
+            f"Telegram Business на {SUBSCRIPTION_DAYS} дней."
+        ),
+        payload=subscription_payload(user_id),
+        provider_token="",
+        currency="XTR",
+        prices=[
+            LabeledPrice(
+                label=f"Подписка на {SUBSCRIPTION_DAYS} дней",
+                amount=STARS_PRICE,
+            )
+        ],
     )
-    builder.adjust(1)
-    return builder.as_markup()
 
 
 def start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
@@ -802,7 +718,7 @@ async def start_handler(message: Message, bot: Bot, db: Database) -> None:
 
     me = await bot.get_me()
     await message.answer(
-        "👋 Это бот архива Telegram Business.\n\n"
+        "👋 Это FisherBot — бот архива Telegram Business.\n\n"
         "После подключения и активации подписки бот сохраняет входящие "
         "сообщения и сообщает вам об их изменении или удалении.\n\n"
         "🔐 Конфиденциальность: записи в базе автоматически удаляются "
@@ -810,7 +726,7 @@ async def start_handler(message: Message, bot: Bot, db: Database) -> None:
         "удалённых сообщений у администратора этой очисткой не удаляются. "
         "Используйте архив только с учётом применимых правил и уведомлений "
         "собеседникам.\n\n"
-        f"Тариф: {SUBSCRIPTION_AMOUNT_RUB} ₽ / {SUBSCRIPTION_DAYS} дней. "
+        f"Тариф: {STARS_PRICE} Stars / {SUBSCRIPTION_DAYS} дней. "
         "Для работы нажмите /start в личном чате с ботом и подключите его "
         "в настройках Telegram Business.",
         reply_markup=start_keyboard(me.username or ""),
@@ -818,156 +734,152 @@ async def start_handler(message: Message, bot: Bot, db: Database) -> None:
 
 
 @router.message(Command("pay"), F.chat.type == "private")
-async def pay_handler(
-    message: Message, crypto: CryptoPayClient, db: Database
-) -> None:
+async def pay_handler(message: Message, bot: Bot, db: Database) -> None:
     if not message.from_user:
         return
 
     await db.ensure_user(message.from_user.id)
     try:
-        invoice = await crypto.create_invoice(message.from_user.id)
-    except CryptoPayError as exc:
-        logger.exception("Не удалось создать счёт для %s", message.from_user.id)
+        await send_subscription_invoice(bot, message.from_user.id)
+    except TelegramAPIError:
+        logger.exception(
+            "Не удалось отправить счёт Telegram Stars пользователю %s",
+            message.from_user.id,
+        )
         await message.answer(
             "Не удалось создать счёт. Попробуйте позже или напишите /support."
         )
-        return
-
-    await message.answer(
-        f"Счёт на {SUBSCRIPTION_AMOUNT_RUB} ₽ создан. После оплаты нажмите "
-        "«Проверить оплату».",
-        reply_markup=payment_keyboard(
-            int(invoice["invoice_id"]),
-            message.from_user.id,
-            str(invoice["pay_url"]),
-        ),
-    )
 
 
 @router.callback_query(F.data == "buy_subscription")
 async def buy_subscription_callback(
-    callback: CallbackQuery, crypto: CryptoPayClient, db: Database
+    callback: CallbackQuery, db: Database
 ) -> None:
     await callback.answer()
+    await db.ensure_user(callback.from_user.id)
+
     try:
-        invoice = await crypto.create_invoice(callback.from_user.id)
-    except CryptoPayError:
+        await send_subscription_invoice(callback.bot, callback.from_user.id)
+    except TelegramAPIError:
         logger.exception(
-            "Не удалось создать счёт для %s", callback.from_user.id
+            "Не удалось отправить счёт Telegram Stars пользователю %s",
+            callback.from_user.id,
         )
         await callback.bot.send_message(
             callback.from_user.id,
             "Не удалось создать счёт. Попробуйте позже или напишите /support.",
         )
-        return
 
-    await db.ensure_user(callback.from_user.id)
-    await callback.bot.send_message(
-        callback.from_user.id,
-        f"Счёт на {SUBSCRIPTION_AMOUNT_RUB} ₽ создан. После оплаты нажмите "
-        "«Проверить оплату».",
-        reply_markup=payment_keyboard(
-            int(invoice["invoice_id"]),
-            callback.from_user.id,
-            str(invoice["pay_url"]),
-        ),
+
+@router.pre_checkout_query()
+async def pre_checkout_handler(pre_checkout_query: PreCheckoutQuery) -> None:
+    """
+    Подтверждает или отклоняет платёж до списания Stars.
+
+    Telegram даёт на ответ около 10 секунд, поэтому здесь выполняются только
+    быстрые проверки параметров, без обращения к внешним сервисам.
+    """
+
+    expected_payload = subscription_payload(pre_checkout_query.from_user.id)
+    is_valid = (
+        pre_checkout_query.invoice_payload == expected_payload
+        and pre_checkout_query.currency == "XTR"
+        and pre_checkout_query.total_amount == STARS_PRICE
     )
 
+    if not is_valid:
+        logger.warning(
+            "Отклонён pre-checkout: user=%s payload=%r currency=%s amount=%s",
+            pre_checkout_query.from_user.id,
+            pre_checkout_query.invoice_payload,
+            pre_checkout_query.currency,
+            pre_checkout_query.total_amount,
+        )
+        await pre_checkout_query.answer(
+            ok=False,
+            error_message=(
+                "Счёт устарел или изменён. Создайте новый счёт командой /pay."
+            ),
+        )
+        return
 
-@router.callback_query(F.data.startswith("paycheck:"))
-async def check_payment_handler(
-    callback: CallbackQuery,
-    crypto: CryptoPayClient,
-    db: Database,
-    admin_id: int,
+    await pre_checkout_query.answer(ok=True)
+
+
+@router.message(F.successful_payment, F.chat.type == "private")
+async def successful_payment(
+    message: Message, bot: Bot, db: Database, admin_id: int
 ) -> None:
-    try:
-        _, invoice_id_raw, owner_id_raw = callback.data.split(":", maxsplit=2)
-        invoice_id = int(invoice_id_raw)
-        invoice_owner_id = int(owner_id_raw)
-    except (ValueError, AttributeError):
-        await callback.answer("Некорректные данные счёта", show_alert=True)
+    """Активирует подписку после подтверждённой Telegram оплаты."""
+
+    payment = message.successful_payment
+    if not message.from_user or payment is None:
         return
 
-    # Кнопку из пересланного сообщения не сможет использовать другой человек.
-    if callback.from_user.id != invoice_owner_id:
-        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
-        return
-
-    await callback.answer("Проверяю платёж…")
-
-    try:
-        invoice = await crypto.get_invoice(invoice_id)
-    except CryptoPayError:
-        logger.exception("Ошибка проверки счёта %s", invoice_id)
-        await callback.bot.send_message(
-            callback.from_user.id,
-            "Не удалось проверить платёж. Попробуйте ещё раз через минуту.",
-        )
-        return
-
-    if invoice is None:
-        await callback.bot.send_message(callback.from_user.id, "Счёт не найден.")
-        return
-
-    # Проверяем принадлежность и параметры счёта по ответу самого Crypto Pay.
-    if str(invoice.get("payload", "")) != str(callback.from_user.id):
-        logger.warning("Счёт %s не принадлежит %s", invoice_id, callback.from_user.id)
-        await callback.bot.send_message(callback.from_user.id, "Счёт не принадлежит вам.")
-        return
-
-    if invoice.get("status") != "paid":
-        status = str(invoice.get("status", "unknown"))
-        await callback.bot.send_message(
-            callback.from_user.id,
-            f"Платёж пока не подтверждён. Текущий статус: {status}.",
-        )
-        return
-
-    try:
-        amount = Decimal(str(invoice.get("amount")))
-    except (InvalidOperation, TypeError, ValueError):
-        amount = Decimal("0")
-
-    expected_invoice = (
-        amount == SUBSCRIPTION_AMOUNT_RUB
-        and invoice.get("currency_type") == "fiat"
-        and invoice.get("fiat") == "RUB"
-        and invoice.get("asset") == "USDT"
+    expected_payload = subscription_payload(message.from_user.id)
+    is_valid = (
+        payment.invoice_payload == expected_payload
+        and payment.currency == "XTR"
+        and payment.total_amount == STARS_PRICE
+        and bool(payment.telegram_payment_charge_id)
     )
-    if not expected_invoice:
-        logger.error("Счёт %s оплачен, но параметры не совпадают", invoice_id)
-        await callback.bot.send_message(
-            callback.from_user.id,
-            "Параметры счёта требуют ручной проверки. Напишите /support.",
+    if not is_valid:
+        logger.error(
+            "Некорректный successful_payment: user=%s payload=%r currency=%s "
+            "amount=%s charge_id=%r",
+            message.from_user.id,
+            payment.invoice_payload,
+            payment.currency,
+            payment.total_amount,
+            payment.telegram_payment_charge_id,
+        )
+        await message.answer(
+            "Платёж получен, но его параметры требуют ручной проверки. "
+            "Напишите /support."
         )
         return
 
-    activated, premium_until = await db.activate_premium(
-        callback.from_user.id, invoice_id
-    )
+    charge_id = payment.telegram_payment_charge_id
+    try:
+        activated, premium_until = await db.activate_premium(
+            message.from_user.id, charge_id
+        )
+    except Exception:
+        logger.exception(
+            "Не удалось активировать подписку: user=%s charge_id=%s",
+            message.from_user.id,
+            charge_id,
+        )
+        await message.answer(
+            "Оплата получена, но подписка пока не активировалась. "
+            "Напишите /support — администратор уже видит ошибку в журнале."
+        )
+        return
+
     if not activated:
-        await callback.bot.send_message(
-            callback.from_user.id,
-            "Этот счёт уже был использован для активации подписки. "
-            f"Подписка действует до {premium_until.strftime('%d.%m.%Y %H:%M UTC')}.",
+        await message.answer(
+            "Эта оплата уже была использована для активации подписки. "
+            f"Подписка действует до "
+            f"{premium_until.strftime('%d.%m.%Y %H:%M UTC')}."
         )
         return
 
-    await callback.bot.send_message(
-        callback.from_user.id,
-        f"🎉 Оплата прошла! Подписка активирована на {SUBSCRIPTION_DAYS} дней.\n"
-        f"Действует до {premium_until.strftime('%d.%m.%Y %H:%M UTC')}.",
+    await message.answer(
+        f"🎉 Оплата прошла успешно! Ваша подписка FisherBot активирована "
+        f"на {SUBSCRIPTION_DAYS} дней."
     )
 
+    username = (
+        f"@{message.from_user.username}"
+        if message.from_user.username
+        else "без username"
+    )
     try:
-        await callback.bot.send_message(
+        await bot.send_message(
             admin_id,
-            "💰 Новая оплата подписки\n"
-            f"Пользователь: {display_user(callback.from_user.id, callback.from_user.username)}\n"
-            f"Счёт: {invoice_id}\n"
-            f"Подписка до: {premium_until.strftime('%d.%m.%Y %H:%M UTC')}",
+            f"💰 Новая оплата через Telegram Stars! "
+            f"Пользователь: {username}, ID: {message.from_user.id}, "
+            f"Сумма: {STARS_PRICE} Звёзд",
         )
     except TelegramAPIError:
         # Ошибка уведомления админа не отменяет уже подтверждённую оплату.
@@ -1215,9 +1127,6 @@ async def cleanup_task(db: Database) -> None:
 
 async def run_bot(settings: Settings) -> None:
     db = Database(settings.db_path)
-    crypto = CryptoPayClient(
-        settings.crypto_pay_token, settings.crypto_pay_api_url
-    )
     bot = Bot(
         token=settings.bot_token,
         default=DefaultBotProperties(parse_mode=None),
@@ -1225,7 +1134,6 @@ async def run_bot(settings: Settings) -> None:
     cleanup: asyncio.Task[None] | None = None
 
     await db.connect()
-    await crypto.start()
 
     try:
         await bot.set_my_commands(
@@ -1242,19 +1150,17 @@ async def run_bot(settings: Settings) -> None:
         cleanup = asyncio.create_task(cleanup_task(db))
 
         logger.info("Бот запущен; используется long polling")
-        # dependency injection aiogram передаст db, crypto и admin_id в те
-        # хэндлеры, где соответствующие аргументы указаны в сигнатуре.
+        # dependency injection aiogram передаст db и admin_id в те хэндлеры,
+        # где соответствующие аргументы указаны в сигнатуре.
         await dispatcher.start_polling(
             bot,
             db=db,
-            crypto=crypto,
             admin_id=settings.admin_id,
         )
     finally:
         if cleanup is not None:
             cleanup.cancel()
             await asyncio.gather(cleanup, return_exceptions=True)
-        await crypto.close()
         await db.close()
         await bot.session.close()
 
