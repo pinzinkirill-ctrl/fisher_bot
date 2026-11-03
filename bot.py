@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 SUBSCRIPTION_DAYS = 30
-SUBSCRIPTION_AMOUNT_RUB = Decimal("150")
+SUBSCRIPTION_AMOUNT_RUB = Decimal("99")
 MESSAGE_RETENTION_HOURS = 48
 CLEANUP_INTERVAL_SECONDS = 24 * 60 * 60
 
