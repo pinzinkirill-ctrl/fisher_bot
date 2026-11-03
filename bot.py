@@ -775,7 +775,7 @@ async def get_authorized_owner(
 
 def payment_keyboard(invoice_id: int, user_id: int, pay_url: str) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.button(text="💳 Оплатить 150 ₽", url=pay_url)
+    builder.button(text="💳 Оплатить 99 ₽", url=pay_url)
     builder.button(
         text="🔄 Проверить оплату",
         callback_data=f"paycheck:{invoice_id}:{user_id}",
